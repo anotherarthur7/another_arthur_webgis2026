@@ -1,0 +1,8 @@
+Hi {{ user.username }},
+
+Please click the link below to activate your CIM account:
+
+{{ activation_url }}
+
+Thanks,
+CIM Team

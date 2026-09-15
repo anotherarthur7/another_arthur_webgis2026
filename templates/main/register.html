@@ -1,0 +1,15 @@
+{% extends 'base/base.html' %}
+
+{% block title %}Register - CIM{% endblock %}
+
+{% block content %}
+<h2>Register</h2>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <div>
+</div>
+    <button type="submit">Register</button>
+</form>
+<p>Already have an account? <a href="{% url 'main:login' %}">Login</a></p>
+{% endblock %}

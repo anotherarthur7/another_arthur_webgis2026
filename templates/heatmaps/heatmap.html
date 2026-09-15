@@ -1,0 +1,166 @@
+{% extends 'base/base.html' %}
+{% load static %}
+{% block title %}Demand Heatmap - CIM{% endblock %}
+
+{% block content %}
+<h1>Demand Heatmap: {{ city_name }}</h1>
+
+<div style="margin-bottom: 15px;">
+  <label>Service Category: 
+    <select id="service-filter">
+      <option value="">All Services</option>
+      {% for cat in service_categories %}
+        <option value="{{ cat.id }}">{{ cat.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button onclick="loadHeatmap()">Update</button>
+  <span id="zoom-info" style="margin-left: 20px; font-style: italic;"></span>
+</div>
+
+<div style="margin-bottom: 10px; font-weight: bold; color: {% if is_premium %}green{% else %}orange{% endif %};">
+    {% if is_premium %}
+        🔑 Premium Plan Active (100m detail available)
+    {% else %}
+        ⚠️ Demo Mode (max 500m detail) — <a href="/subscribe/">Upgrade</a>
+    {% endif %}
+</div>
+
+<!-- LOADING INDICATOR -->
+<div id="loading" style="display:none; position:absolute; top:20px; right:20px; background:white; padding:10px; border:1px solid #ccc; z-index:1000; border-radius:4px;">
+  🔍 Calculating demand hotspots...
+</div>
+
+<div id="map" style="width: 100%; height: 600px; border: 1px solid #ccc;"></div>
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v7.4.0/ol.css">
+<script src="https://cdn.jsdelivr.net/npm/ol@v7.4.0/dist/ol.js"></script>
+
+<script>
+let map;
+
+const HEATMAP_CONFIG = {
+    minIntensity: 2,        // Minimum to show (matches SQL HAVING)
+    maxVisibleIntensity: 15, // Cap max for color scaling
+    colorCoeff: 0.4         // Adjust brightness (lower = more gradual)
+};
+
+// Initialize map
+function initMap() {
+    const centerLon = parseFloat("{{ city_center_lon }}") || 92.8558;
+    const centerLat = parseFloat("{{ city_center_lat }}") || 56.0184;
+    const mapCenter = ol.proj.fromLonLat([centerLon, centerLat]);
+
+    const heatmapLayer = new ol.layer.Vector({
+        source: new ol.source.Vector(),
+        name: 'heatmap'
+    });
+
+    map = new ol.Map({
+        target: 'map',
+        layers: [
+            new ol.layer.Tile({ source: new ol.source.OSM() }),
+            heatmapLayer
+        ],
+        view: new ol.View({ center: mapCenter, zoom: 11 })
+    });
+
+    // Auto-reload on zoom change (debounced)
+    let zoomTimeout;
+    map.getView().on('change:resolution', () => {
+        clearTimeout(zoomTimeout);
+        zoomTimeout = setTimeout(() => {
+            updateZoomInfo();
+            loadHeatmap();
+        }, 500);
+    });
+
+    // Initial load
+    updateZoomInfo();
+    loadHeatmap();
+}
+
+function updateZoomInfo() {
+    const zoom = map.getView().getZoom();
+    let detail;
+    if (zoom <= 10) detail = "1000m";
+    else if (zoom <= 13) detail = "500m";
+    else detail = "100m";
+    
+    document.getElementById('zoom-info').textContent = 
+        `Resolution: ${detail} (zoom ${zoom.toFixed(1)})`;
+}
+
+window.loadHeatmap = function() {
+    const serviceId = document.getElementById('service-filter').value;
+    const zoom = map.getView().getZoom();
+    
+    // Show loading
+    document.getElementById('loading').style.display = 'block';
+    const heatmapLayer = map.getLayers().getArray().find(l => l.get('name') === 'heatmap');
+    heatmapLayer.getSource().clear();
+
+    fetch(`/heatmap/data/?service_id=${serviceId}&zoom=${zoom}`, {
+        headers: { 'X-CSRFToken': '{{ csrf_token }}' }
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) {
+            alert('Error: ' + data.error);
+            return;
+        }
+
+        const source = heatmapLayer.getSource();
+        const format = new ol.format.GeoJSON();
+
+        // Add boundary
+        if (data.boundary) {
+            const boundary = format.readFeature(data.boundary, {
+                dataProjection: 'EPSG:4326',
+                featureProjection: 'EPSG:3857'
+            });
+            boundary.setStyle(new ol.style.Style({
+                stroke: new ol.style.Stroke({ color: '#00f', width: 1 }),
+                fill: new ol.style.Fill({ color: 'rgba(0,0,255,0.05)' })
+            }));
+            source.addFeature(boundary);
+        }
+
+        // Add heatmap cells
+        if (data.features.length === 0) {
+            console.warn("No demand hotspots found");
+        } else {
+            const maxIntensity = Math.max(...data.features.map(f => f.properties.intensity), 1);
+            data.features.forEach(feat => {
+                const feature = format.readFeature(feat, {
+                    dataProjection: 'EPSG:4326',
+                    featureProjection: 'EPSG:3857'
+                });
+                const intensity = feat.properties.intensity;
+                const clamped = Math.min(intensity, HEATMAP_CONFIG.maxVisibleIntensity);
+                const normalized = clamped / HEATMAP_CONFIG.maxVisibleIntensity;
+                const ratio = Math.pow(normalized, HEATMAP_CONFIG.colorCoeff); // Log-like curve
+
+                feature.setStyle(new ol.style.Style({
+                    fill: new ol.style.Fill({ 
+                        color: `rgba(${Math.floor(255 * ratio)},${Math.floor(200 * (1 - ratio))},0,0.7)` 
+                    }),
+                    stroke: new ol.style.Stroke({ color: '#fff', width: 0.5 })
+                }));
+                source.addFeature(feature);
+            });
+        }
+    })
+    .catch(err => {
+        console.error('Heatmap failed:', err);
+        alert('Failed to load heatmap');
+    })
+    .finally(() => {
+        document.getElementById('loading').style.display = 'none';
+    });
+};
+
+// Start when DOM ready
+window.addEventListener('DOMContentLoaded', initMap);
+</script>
+{% endblock %}

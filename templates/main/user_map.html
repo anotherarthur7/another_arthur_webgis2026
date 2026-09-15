@@ -1,0 +1,469 @@
+{% extends 'base/base.html' %}
+{% load static %}
+
+{% block title %}User Map (OpenLayers) - CIM{% endblock %}
+
+{% block content %}
+<h1>Select Your Locations ({{ city_name }})</h1>
+<div id="map" style="width: 100%; height: 600px; border: 1px solid #ccc;"></div>
+
+<div id="location-info" style="margin-top: 15px; padding: 10px; background: #f9f9f9;">
+  <p>Click on the map to add up to 3 locations.</p>
+  <div id="locations-list"></div>
+  
+  <div id="edit-panel" style="display: none; margin-top: 15px; padding: 15px; background: #e9ecef; border-radius: 5px;">
+    <h3>Edit Location</h3>
+    <div style="margin: 10px 0;">
+      <label>
+        <input type="radio" name="access_mode" value="foot" id="mode-foot"> Foot (800m)
+      </label><br>
+      <label>
+        <input type="radio" name="access_mode" value="car" id="mode-car"> Car (3000m)
+      </label>
+    </div>
+    <div style="margin: 10px 0;">
+      <label>Custom radius (meters): <span id="current-radius">800</span></label><br>
+      <input type="range" id="radius-slider" min="100" max="5000" value="800" step="50" style="width: 100%;">
+    </div>
+    <!-- ✅ SERVICE NEEDS -->
+    <div style="margin: 15px 0;">
+        <h4>What do you need here? (Up to 3)</h4>
+        <div id="service-choices">
+        {% for cat in service_categories %}
+            <label style="display: block; margin: 5px 0;">
+            <input type="checkbox" name="service" value="{{ cat.id }}" data-name="{{ cat.name }}"> {{ cat.name }}
+            </label>
+        {% endfor %}
+        </div>
+        <div id="service-error" style="color: red; font-size: 0.9em; margin-top: 5px; display: none;"></div>
+    </div>
+    <button onclick="window.mapApp.saveEditedLocation()">Save</button>
+    <button onclick="window.mapApp.deleteLocation()">Delete</button>
+    <button onclick="window.mapApp.closeEditPanel()">Cancel</button>
+  </div>
+</div>
+
+<!-- OpenLayers CSS -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v7.4.0/ol.css">
+
+<!-- Libraries -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.8.1/proj4.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ol@v7.4.0/dist/ol.js"></script>
+
+<script>
+(function () {
+    // === Configuration from Django ===
+    const CITY_NAME = "{{ city_name }}";
+    const CENTER_LON = parseFloat("{{ city_center_lon }}");
+    const CENTER_LAT = parseFloat("{{ city_center_lat }}");
+    const LOCAL_PROJ_CODE = "{{ city_projection_code }}";
+    const LOCAL_PROJ_DEF = "{{ city_projection_def|safe }}";
+
+    const VIEW_PROJECTION = 'EPSG:3857';
+    const SOURCE_PROJECTION = 'EPSG:4326';
+
+    let hasLocalProjection = false;
+    if (LOCAL_PROJ_CODE && LOCAL_PROJ_DEF && LOCAL_PROJ_CODE !== 'EPSG:3857') {
+        proj4.defs(LOCAL_PROJ_CODE, LOCAL_PROJ_DEF);
+        ol.proj.proj4.register(proj4);
+        hasLocalProjection = ol.proj.get(LOCAL_PROJ_CODE) !== null;
+    }
+
+    // === Map Setup ===
+    const mapCenter = ol.proj.fromLonLat([CENTER_LON, CENTER_LAT], VIEW_PROJECTION);
+    const vectorSource = new ol.source.Vector();
+    const map = new ol.Map({
+        target: 'map',
+        layers: [
+            new ol.layer.Tile({ source: new ol.source.OSM() }),
+            new ol.layer.Vector({ source: vectorSource })
+        ],
+        view: new ol.View({
+            projection: VIEW_PROJECTION,
+            center: mapCenter,
+            zoom: 11
+        })
+    });
+
+    // === Styling ===
+    const LOCATION_COLORS = [
+        'rgba(255, 255, 255, 0.3)',
+        'rgba(255, 255, 255, 0.3)',
+        'rgba(247, 251, 243, 0.3)'
+    ];
+    const STROKE_COLORS = { foot: '#16a34a', car: '#dc2626' };
+
+    // === Geometry Helpers ===
+    function createAccurateCircle(lon, lat, radiusMeters) {
+        let centerLocal;
+        if (hasLocalProjection) {
+            centerLocal = ol.proj.transform([lon, lat], SOURCE_PROJECTION, LOCAL_PROJ_CODE);
+        } else {
+            centerLocal = ol.proj.transform([lon, lat], SOURCE_PROJECTION, VIEW_PROJECTION);
+        }
+
+        const coords = [];
+        const sides = 64;
+        for (let i = 0; i <= sides; i++) {
+            const angle = (i * 2 * Math.PI) / sides;
+            coords.push([
+                centerLocal[0] + radiusMeters * Math.cos(angle),
+                centerLocal[1] + radiusMeters * Math.sin(angle)
+            ]);
+        }
+        const localCircle = new ol.geom.Polygon([coords]);
+
+        if (hasLocalProjection) {
+            localCircle.transform(LOCAL_PROJ_CODE, VIEW_PROJECTION);
+        }
+        return localCircle;
+    }
+
+        function createServiceIcons(serviceIds, index) {
+        if (!serviceIds || serviceIds.length === 0) return [];
+        
+        // Simple emoji mapping (you can customize these)
+        const ICON_MAP = {
+            1: '🍞',  // Bakery
+            2: '💊',  // Pharmacy
+            3: '☕',  // Cafe
+            4: '🚗',  // Car wash
+            5: '💪',  // Gym
+            6: '🛒',  // Grocery
+            7: '✂️',  // Barber
+            8: '🔧',  // Auto repair
+            9: '🧺',  // Laundry
+            10: '📮'  // Post office
+        };
+        
+        const icons = [];
+        const angleStep = (2 * Math.PI) / Math.min(serviceIds.length, 3);
+        const radius = 40; // pixels from center
+        
+        serviceIds.slice(0, 3).forEach((id, i) => {
+            const angle = angleStep * i - Math.PI / 2; // Start from top
+            const offsetX = radius * Math.cos(angle);
+            const offsetY = radius * Math.sin(angle);
+            const icon = ICON_MAP[id] || '❓';
+            
+            const iconStyle = new ol.style.Style({
+                text: new ol.style.Text({
+                    text: icon,
+                    font: '24px sans-serif',
+                    offsetY: -offsetY,
+                    offsetX: offsetX,
+                    // NO background = fully transparent!
+                })
+            });
+            
+            icons.push(iconStyle);
+        });
+        
+        return icons;
+    }
+
+    // === Feature Drawing ===
+    function drawLocation(loc, index) {
+        if (typeof loc.lon !== 'number' || typeof loc.lat !== 'number' || !isFinite(loc.lon) || !isFinite(loc.lat)) {
+            return;
+        }
+
+        const radius = loc.radius_meters || (loc.access_mode === 'foot' ? 800 : 3000);
+        const circleGeom = createAccurateCircle(loc.lon, loc.lat, radius);
+
+        const circleFeature = new ol.Feature({ geometry: circleGeom, type: 'circle', locationData: loc });
+        circleFeature.setStyle([
+            new ol.style.Style({
+                fill: new ol.style.Fill({ color: LOCATION_COLORS[index % 3] }),
+                stroke: new ol.style.Stroke({ color: STROKE_COLORS[loc.access_mode], width: 2 })
+            }),
+            new ol.style.Style({
+                fill: new ol.style.Fill({ color: 'rgba(0,0,0,0.01)' }),
+                stroke: new ol.style.Stroke({ color: 'rgba(0,0,0,0.01)', width: 10 })
+            })
+        ]);
+
+        // Replace the marker feature creation in drawLocation
+        const point3857 = ol.proj.fromLonLat([loc.lon, loc.lat], VIEW_PROJECTION);
+        const markerFeature = new ol.Feature({
+            geometry: new ol.geom.Point(point3857),
+            type: 'marker',
+            locationData: loc
+        });
+
+        // Main blue dot + service icons
+        const mainStyle = new ol.style.Style({
+            image: new ol.style.Circle({
+                radius: 8,
+                fill: new ol.style.Fill({ color: '#3b82f6' }),
+                stroke: new ol.style.Stroke({ color: '#fff', width: 2 })
+            })
+        });
+
+        const serviceIconStyles = createServiceIcons(loc.service_category_ids, index);
+        const allStyles = [mainStyle, ...serviceIconStyles];
+
+        markerFeature.setStyle(allStyles);
+
+        vectorSource.addFeature(circleFeature);
+        vectorSource.addFeature(markerFeature);
+    }
+
+    // === State & UI ===
+    let locations = [];
+    const MAX_LOCATIONS = 3;
+
+    function updateLocationList() {
+        const listDiv = document.getElementById('locations-list');
+        listDiv.innerHTML = '';
+        locations.forEach((loc, index) => {
+            const services = loc.service_category_ids?.map(id => {
+                const input = document.querySelector(`#service-choices input[value="${id}"]`);
+                return input ? input.dataset.name : 'Unknown';
+            }).join(', ') || 'None';
+
+            const div = document.createElement('div');
+            div.innerHTML = `
+                <strong>Location ${index + 1}:</strong> 
+                ${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)} | 
+                Mode: ${loc.access_mode} | Radius: ${loc.radius_meters}m | Needs: ${services}
+                <button onclick="window.mapApp.removeLocation(${index})">Remove</button>
+            `;
+            listDiv.appendChild(div);
+        });
+    }
+
+    function redrawMap() {
+        vectorSource.clear();
+        locations.forEach((loc, idx) => drawLocation(loc, idx));
+        updateLocationList();
+    }
+
+    // ✅ SERVICE HELPERS
+    function getSelectedServices() {
+        const checkboxes = document.querySelectorAll('#service-choices input[type="checkbox"]:checked');
+        const ids = Array.from(checkboxes).map(cb => parseInt(cb.value));
+        const errorDiv = document.getElementById('service-error');
+        
+        if (ids.length > 3) {
+            errorDiv.textContent = "You can select up to 3 services.";
+            errorDiv.style.display = 'block';
+            return null;
+        }
+        errorDiv.style.display = 'none';
+        return ids;
+    }
+
+    function setServiceCheckboxes(serviceIds) {
+        const checkboxes = document.querySelectorAll('#service-choices input[type="checkbox"]');
+        checkboxes.forEach(cb => {
+            cb.checked = serviceIds?.includes(parseInt(cb.value)) || false;
+        });
+    }
+
+    // === Edit Panel ===
+    function showEditPanel(loc) {
+        const isFoot = loc.access_mode === 'foot';
+        document.getElementById('mode-foot').checked = isFoot;
+        document.getElementById('mode-car').checked = !isFoot;
+        
+        // ✅ Set radius to effective value
+        const effectiveRadius = loc.radius_meters || (isFoot ? 800 : 3000);
+        document.getElementById('radius-slider').value = effectiveRadius;
+        document.getElementById('current-radius').textContent = effectiveRadius;
+        setServiceCheckboxes(loc.service_category_ids);
+        window.mapApp.editingLocation = loc;
+        document.getElementById('edit-panel').style.display = 'block';
+    }
+
+    function closeEditPanel() {
+        document.getElementById('edit-panel').style.display = 'none';
+        window.mapApp.editingLocation = null;
+    }
+
+    function previewEdit() {
+        const loc = window.mapApp.editingLocation;
+        if (!loc) return;
+        const mode = document.getElementById('mode-foot').checked ? 'foot' : 'car';
+        const radius = parseInt(document.getElementById('radius-slider').value);
+        const idx = locations.findIndex(l => l.id === loc.id);
+        if (idx !== -1) {
+            const serviceIds = getSelectedServices();
+            if (serviceIds === null) return; // validation failed
+            locations[idx] = { ...locations[idx], access_mode: mode, radius_meters: radius, service_category_ids: serviceIds };
+            redrawMap();
+            document.getElementById('current-radius').textContent = radius;
+        }
+    }
+
+    document.getElementById('radius-slider')?.addEventListener('input', previewEdit);
+    document.getElementById('mode-foot')?.addEventListener('change', previewEdit);
+    document.getElementById('mode-car')?.addEventListener('change', previewEdit);
+
+    // === API Functions ===
+    window.mapApp = {
+        editingLocation: null,
+
+        saveEditedLocation() {
+            const loc = this.editingLocation;
+            if (!loc || !loc.id) return;
+            const mode = document.getElementById('mode-foot').checked ? 'foot' : 'car';
+            const radius = parseInt(document.getElementById('radius-slider').value);
+            const serviceIds = getSelectedServices();
+            if (serviceIds === null) return;
+
+            fetch(`/locations/api/locations/${loc.id}/`, {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': window.cimConfig.csrfToken
+                },
+                body: JSON.stringify({ access_mode: mode, radius_meters: radius, service_category_ids: serviceIds })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.id) {
+                    const idx = locations.findIndex(l => l.id === loc.id);
+                    if (idx !== -1) locations[idx] = data;
+                    redrawMap();
+                    closeEditPanel();
+                } else {
+                    alert('Save failed: ' + (data?.error || 'Unknown error'));
+                }
+            })
+            .catch(err => alert('Error: ' + err));
+        },
+
+        deleteLocation() {
+            if (!confirm('Delete this location?')) return;
+            const loc = this.editingLocation;
+            if (!loc || !loc.id) return;
+
+            fetch(`/locations/api/locations/${loc.id}/`, {
+                method: 'DELETE',
+                headers: { 'X-CSRFToken': window.cimConfig.csrfToken }
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success !== false) {
+                    locations = locations.filter(l => l.id !== loc.id);
+                    redrawMap();
+                    closeEditPanel();
+                }
+            })
+            .catch(err => alert('Delete error'));
+        },
+
+        closeEditPanel,
+
+        removeLocation(index) {
+            const loc = locations[index];
+            if (!loc || !loc.id) return;
+            if (!confirm('Delete this location?')) return;
+            
+            fetch(`/locations/api/locations/${loc.id}/`, {
+                method: 'DELETE',
+                headers: { 'X-CSRFToken': window.cimConfig.csrfToken }
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success !== false) {
+                    locations.splice(index, 1);
+                    redrawMap();
+                }
+            });
+        }
+    };
+
+    // === Load & Click Handlers ===
+    function loadLocations() {
+        fetch(window.cimConfig.apiUrl.locations, {
+            headers: { 'X-CSRFToken': window.cimConfig.csrfToken }
+        })
+        .then(r => r.json())
+        .then(data => {
+            locations = data.map(loc => ({
+                ...loc,
+                radius_meters: loc.radius_meters !== null 
+                    ? loc.radius_meters 
+                    : (loc.access_mode === 'foot' ? 800 : 3000)
+            })).filter(loc => 
+                typeof loc.lat === 'number' && 
+                typeof loc.lon === 'number' &&
+                isFinite(loc.lat) && 
+                isFinite(loc.lon)
+            );
+            redrawMap();
+        })
+        .catch(err => {
+            console.error('Load locations failed:', err);
+            locations = [];
+            updateLocationList();
+        });
+    }
+
+    map.on('click', function (evt) {
+        const feature = map.forEachFeatureAtPixel(evt.pixel, f => f);
+        if (feature) {
+            const loc = feature.get('locationData');
+            if (loc && loc.id) {
+                const currentLoc = locations.find(l => l.id === loc.id);
+                if (currentLoc) {
+                    showEditPanel(currentLoc);
+                    return;
+                }
+            }
+        }
+
+        if (locations.length >= MAX_LOCATIONS) {
+            alert('You can only add up to 3 locations.');
+            return;
+        }
+
+        const lonLat = ol.proj.toLonLat(evt.coordinate, VIEW_PROJECTION);
+        const serviceIds = getSelectedServices(); // ← for create!
+        if (serviceIds === null) {
+            alert('Please select up to 3 services before adding location.');
+            return;
+        }
+
+        const loc = {
+            lat: lonLat[1],
+            lon: lonLat[0],
+            access_mode: 'foot',
+            radius_meters: 800,
+            service_category_ids: serviceIds
+        };
+
+        fetch(window.cimConfig.apiUrl.create, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': window.cimConfig.csrfToken
+            },
+            body: JSON.stringify(loc)
+        })
+        .then(r => r.json())
+        .then(data => {
+            locations.push(data);
+            redrawMap();
+        })
+        .catch(err => {
+            console.error('Add location error:', err);
+            alert('Failed to add location');
+        });
+    });
+
+    // === Initialize ===
+    window.cimConfig = {
+        csrfToken: '{{ csrf_token }}',
+        apiUrl: {
+            locations: '{% url "locations:get_locations" %}',
+            create: '{% url "locations:save_location" %}'
+        }
+    };
+
+    loadLocations();
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,400 @@
+{% extends 'base/base.html' %}
+{% load static %}
+{% block title %}User Map (Yandex) - CIM{% endblock %}
+
+{% block content %}
+<h1>Select Your Locations ({{ city_name }})</h1>
+<div id="map" style="width: 100%; height: 600px; border: 1px solid #ccc;"></div>
+
+<div id="location-info" style="margin-top: 15px; padding: 10px; background: #f9f9f9;">
+  <p>Click on the map to add up to 3 locations.</p>
+  <div id="locations-list"></div>
+  
+  <div id="edit-panel" style="display: none; margin-top: 15px; padding: 15px; background: #e9ecef; border-radius: 5px;">
+    <h3>Edit Location</h3>
+    <div style="margin: 10px 0;">
+      <label>
+        <input type="radio" name="access_mode" value="foot" id="mode-foot"> Foot (800m)
+      </label><br>
+      <label>
+        <input type="radio" name="access_mode" value="car" id="mode-car"> Car (3000m)
+      </label>
+    </div>
+    <div style="margin: 10px 0;">
+      <label>Custom radius (meters): <span id="current-radius">800</span></label><br>
+      <input type="range" id="radius-slider" min="100" max="5000" value="800" step="50" style="width: 100%;">
+    </div>
+    <!-- ✅ SERVICE NEEDS -->
+    <div style="margin: 15px 0;">
+        <h4>What do you need here? (Up to 3)</h4>
+        <div id="service-choices">
+        {% for cat in service_categories %}
+            <label style="display: block; margin: 5px 0;">
+            <input type="checkbox" name="service" value="{{ cat.id }}" data-name="{{ cat.name }}"> {{ cat.name }}
+            </label>
+        {% endfor %}
+        </div>
+        <div id="service-error" style="color: red; font-size: 0.9em; margin-top: 5px; display: none;"></div>
+    </div>
+    <button onclick="window.mapApp.saveEditedLocation()">Save</button>
+    <button onclick="window.mapApp.deleteLocation()">Delete</button>
+    <button onclick="window.mapApp.closeEditPanel()">Cancel</button>
+  </div>
+</div>
+
+<!-- Load Yandex Maps API -->
+<script src="https://api-maps.yandex.ru/2.1/?apikey={{ YANDEX_MAPS_API_KEY }}&lang=ru_RU" type="text/javascript"></script>
+
+<script>
+// Fallback coordinates from Django (in case geocoding fails)
+const FALLBACK_CENTER = [{{ city_center_lat|default:"55.7558" }}, {{ city_center_lon|default:"37.6173" }}];
+const CITY_NAME = "{{ city_name|escapejs }}";
+
+// Config for API calls
+window.cimConfig = {
+    csrfToken: '{{ csrf_token }}',
+    apiUrl: {
+        locations: '{% url "locations:get_locations" %}',
+        create: '{% url "locations:save_location" %}'
+    }
+};
+
+(function () {
+    let map, locations = [], editingLocation = null;
+    const MAX_LOCATIONS = 3;
+
+    // Circle using spherical approximation (Yandex-optimized)
+    function createCircle(lat, lon, radiusMeters, sides = 64) {
+        const earthRadius = 6378137;
+        const circle = [];
+        for (let i = 0; i <= sides; i++) {
+            const angle = (i * 2 * Math.PI) / sides;
+            const dx = radiusMeters * Math.cos(angle);
+            const dy = radiusMeters * Math.sin(angle);
+            const latOffset = (dy / earthRadius) * (180 / Math.PI);
+            const lonOffset = (dx / (earthRadius * Math.cos((lat * Math.PI) / 180))) * (180 / Math.PI);
+            circle.push([lat + latOffset, lon + lonOffset]);
+        }
+        return circle;
+    }
+
+    function drawLocation(loc) {
+        const radius = loc.radius_meters || (loc.access_mode === 'foot' ? 800 : 3000);
+        const circleCoords = createCircle(loc.lat, loc.lon, radius);
+        
+        const circle = new ymaps.Polygon([circleCoords], {}, {
+            fillColor: loc.access_mode === 'foot' ? "#00FF0020" : "#FF000020",
+            strokeColor: loc.access_mode === 'foot' ? "#00AA00" : "#AA0000",
+            strokeWidth: 2,
+            fillOpacity: 0.1
+        });
+        
+        const marker = new ymaps.Placemark([loc.lat, loc.lon], {}, {
+            preset: loc.access_mode === 'foot' ? 'islands#blueDotIcon' : 'islands#redDotIcon'
+        });
+        
+        const handleClick = () => showEditPanel(loc);
+        marker.events.add('click', handleClick);
+        circle.events.add('click', handleClick);
+        
+        map.geoObjects.add(marker);
+        map.geoObjects.add(circle);
+    }
+
+    function updateLocationList() {
+        const listDiv = document.getElementById('locations-list');
+        listDiv.innerHTML = '';
+        locations.forEach((loc, index) => {
+            const services = loc.service_category_ids?.map(id => {
+                const input = document.querySelector(`#service-choices input[value="${id}"]`);
+                return input ? input.dataset.name : 'Unknown';
+            }).join(', ') || 'None';
+
+            const div = document.createElement('div');
+            div.innerHTML = `
+                <strong>Location ${index + 1}:</strong> 
+                ${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)} | 
+                Mode: ${loc.access_mode} | Radius: ${loc.radius_meters}m | Needs: ${services}
+                <button onclick="window.mapApp.removeLocation(${index})">Remove</button>
+            `;
+            listDiv.appendChild(div);
+        });
+    }
+
+    // ✅ SERVICE HELPERS
+    function getSelectedServices() {
+        const checkboxes = document.querySelectorAll('#service-choices input[type="checkbox"]:checked');
+        const ids = Array.from(checkboxes).map(cb => parseInt(cb.value));
+        const errorDiv = document.getElementById('service-error');
+        
+        if (ids.length > 3) {
+            errorDiv.textContent = "You can select up to 3 services.";
+            errorDiv.style.display = 'block';
+            return null;
+        }
+        errorDiv.style.display = 'none';
+        return ids;
+    }
+
+    function setServiceCheckboxes(serviceIds) {
+        const checkboxes = document.querySelectorAll('#service-choices input[type="checkbox"]');
+        checkboxes.forEach(cb => {
+            cb.checked = serviceIds?.includes(parseInt(cb.value)) || false;
+        });
+    }
+
+    function showEditPanel(loc) {
+        document.getElementById('mode-foot').checked = loc.access_mode === 'foot';
+        document.getElementById('mode-car').checked = loc.access_mode === 'car';
+        const radius = loc.radius_meters || (loc.access_mode === 'foot' ? 800 : 3000);
+        document.getElementById('radius-slider').value = radius;
+        document.getElementById('current-radius').textContent = radius;
+        setServiceCheckboxes(loc.service_category_ids);
+        editingLocation = loc;
+        document.getElementById('edit-panel').style.display = 'block';
+        
+        // Setup event listeners when panel opens
+        setupEditPanelListeners();
+    }
+
+    function setupEditPanelListeners() {
+        const modeFoot = document.getElementById('mode-foot');
+        const modeCar = document.getElementById('mode-car');
+        const radiusSlider = document.getElementById('radius-slider');
+        const currentRadius = document.getElementById('current-radius');
+
+        if (!modeFoot || !modeCar || !radiusSlider || !currentRadius) return;
+
+        function handleModeChange() {
+            const isFoot = modeFoot.checked;
+            const defaultRadius = isFoot ? 800 : 3000;
+            radiusSlider.value = defaultRadius;
+            currentRadius.textContent = defaultRadius;
+            previewEdit();
+        }
+
+        function handleRadiusChange() {
+            currentRadius.textContent = radiusSlider.value;
+            previewEdit();
+        }
+
+        // Remove existing listeners to avoid duplicates
+        modeFoot.removeEventListener('change', handleModeChange);
+        modeCar.removeEventListener('change', handleModeChange);
+        radiusSlider.removeEventListener('input', handleRadiusChange);
+
+        // Attach fresh listeners
+        modeFoot.addEventListener('change', handleModeChange);
+        modeCar.addEventListener('change', handleModeChange);
+        radiusSlider.addEventListener('input', handleRadiusChange);
+    }
+
+    function previewEdit() {
+        if (!editingLocation) return;
+        const mode = document.getElementById('mode-foot').checked ? 'foot' : 'car';
+        const radius = parseInt(document.getElementById('radius-slider').value);
+        const idx = locations.findIndex(l => l.id === editingLocation.id);
+        if (idx !== -1) {
+            const serviceIds = getSelectedServices();
+            if (serviceIds === null) return;
+            locations[idx] = { ...locations[idx], access_mode: mode, radius_meters: radius, service_category_ids: serviceIds };
+            redrawMap();
+            document.getElementById('current-radius').textContent = radius;
+        }
+    }
+
+    function closeEditPanel() {
+        document.getElementById('edit-panel').style.display = 'none';
+        editingLocation = null;
+    }
+
+    function saveEditedLocation() {
+        if (!editingLocation || !editingLocation.id) return;
+        const mode = document.getElementById('mode-foot').checked ? 'foot' : 'car';
+        const radius = parseInt(document.getElementById('radius-slider').value);
+        const serviceIds = getSelectedServices();
+        if (serviceIds === null) return;
+
+        fetch(`/locations/api/locations/${editingLocation.id}/`, {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': window.cimConfig.csrfToken
+            },
+            body: JSON.stringify({ 
+                access_mode: mode, 
+                radius_meters: radius,
+                service_category_ids: serviceIds
+            })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data && data.id) {
+                const idx = locations.findIndex(l => l.id === editingLocation.id);
+                if (idx !== -1) locations[idx] = data;
+                redrawMap();
+                closeEditPanel();
+            } else {
+                alert('Save failed: ' + (data?.error || 'Unknown error'));
+            }
+        })
+        .catch(err => alert('Error: ' + err));
+    }
+
+    function deleteLocation() {
+        if (!editingLocation || !editingLocation.id) return;
+        if (!confirm('Delete this location?')) return;
+
+        fetch(`/locations/api/locations/${editingLocation.id}/`, {
+            method: 'DELETE',
+            headers: { 'X-CSRFToken': window.cimConfig.csrfToken }
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data && (data.success !== false)) {
+                locations = locations.filter(l => l.id !== editingLocation.id);
+                redrawMap();
+                closeEditPanel();
+            }
+        })
+        .catch(err => alert('Delete error'));
+    }
+
+    function removeLocation(index) {
+        const loc = locations[index];
+        if (!loc || !loc.id) return;
+        if (!confirm('Delete this location?')) return;
+        
+        fetch(`/locations/api/locations/${loc.id}/`, {
+            method: 'DELETE',
+            headers: { 'X-CSRFToken': window.cimConfig.csrfToken }
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data && (data.success !== false)) {
+                locations.splice(index, 1);
+                redrawMap();
+            }
+        });
+    }
+
+    function redrawMap() {
+        map.geoObjects.removeAll();
+        locations.forEach(drawLocation);
+        updateLocationList();
+    }
+
+    function loadLocations() {
+        fetch(window.cimConfig.apiUrl.locations, {
+            headers: { 'X-CSRFToken': window.cimConfig.csrfToken }
+        })
+        .then(r => r.json())
+        .then(data => {
+            locations = data
+                .filter(loc => typeof loc.lat === 'number' && typeof loc.lon === 'number' && isFinite(loc.lat) && isFinite(loc.lon))
+                .map(loc => ({
+                    ...loc,
+                    radius_meters: loc.radius_meters !== null ? loc.radius_meters : (loc.access_mode === 'foot' ? 800 : 3000)
+                }));
+            locations.forEach(drawLocation);
+            updateLocationList();
+        })
+        .catch(err => {
+            console.error('Load locations failed:', err);
+            locations = [];
+            updateLocationList();
+        });
+    }
+
+    function handleMapClick(e) {
+        if (locations.length >= MAX_LOCATIONS) {
+            alert('You can only add up to 3 locations.');
+            return;
+        }
+
+        const serviceIds = getSelectedServices();
+        if (serviceIds === null) {
+            alert('Please select up to 3 services before adding location.');
+            return;
+        }
+
+        const coords = e.get('coords');
+        const loc = {
+            lat: coords[0],
+            lon: coords[1],
+            access_mode: 'foot',
+            radius_meters: 800,
+            service_category_ids: serviceIds
+        };
+
+        fetch(window.cimConfig.apiUrl.create, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': window.cimConfig.csrfToken
+            },
+            body: JSON.stringify(loc)
+        })
+        .then(r => r.json())
+        .then(data => {
+            locations.push(data);
+            drawLocation(data);
+            updateLocationList();
+        })
+        .catch(err => {
+            console.error('Add location error:', err);
+            alert('Failed to add location');
+        });
+    }
+
+    // ✅ Initialize map using YANDEX GEOCODING
+    function initMap() {
+        // Try to geocode city name first
+        ymaps.geocode(CITY_NAME, {
+            results: 1,
+            // Focus on Russia to avoid ambiguity (e.g., "Kazan" in Tatarstan vs elsewhere)
+            boundedBy: [[41.1811, 82.0], [80.0, 179.9]] // Rough Russia bounds
+        }).then(res => {
+            if (res.geoObjects.getLength()) {
+                const point = res.geoObjects.get(0);
+                const coords = point.geometry.getCoordinates();
+                map = new ymaps.Map('map', {
+                    center: coords,
+                    zoom: 11
+                });
+                setupMap();
+            } else {
+                // Fallback to Django-provided center
+                initWithFallback();
+            }
+        }).catch(() => {
+            initWithFallback();
+        });
+    }
+
+    function initWithFallback() {
+        console.warn("Yandex geocoding failed, using fallback center");
+        map = new ymaps.Map('map', {
+            center: FALLBACK_CENTER,
+            zoom: 11
+        });
+        setupMap();
+    }
+
+    function setupMap() {
+        map.events.add('click', handleMapClick);
+        loadLocations();
+    }
+
+    window.mapApp = {
+        saveEditedLocation,
+        deleteLocation,
+        closeEditPanel,
+        removeLocation,
+        editingLocation: null
+    };
+
+    ymaps.ready(initMap);
+})();
+</script>
+{% endblock %}

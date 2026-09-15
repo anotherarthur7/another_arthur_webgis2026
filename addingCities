@@ -1,0 +1,34 @@
+from django.contrib.gis.geos import Point
+from apps.geo.models import Country, City
+from django.contrib.auth.models import User
+from apps.users.models import UserProfile
+
+# 1. Create or get Russia
+russia, created = Country.objects.get_or_create(
+    name="Russia",
+    iso_code="RU"
+)
+print(f"✅ Country: {russia}")
+
+# 2. Create Krasnoyarsk
+krasnoyarsk, created = City.objects.get_or_create(
+    name="Krasnoyarsk",
+    country=russia,
+    projection_code="EPSG:28416",
+    projection_definition="+proj=tmerc +lat_0=0 +lon_0=93 +k=1 +x_0=16500000 +y_0=0 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs",
+    defaults={
+        'center_point': Point(92.8558, 56.0184, srid=4326)  # lon, lat
+    }
+)
+print(f"✅ City: {krasnoyarsk}")
+
+# 3. Assign your user to Krasnoyarsk
+username = 'arthurTester'  # ← UPDATE THIS IF NEEDED
+try:
+    user = User.objects.get(username=username)
+    profile, created = UserProfile.objects.get_or_create(user=user)
+    profile.city = krasnoyarsk
+    profile.save()
+    print(f"✅ Assigned user '{username}' to {krasnoyarsk.name}")
+except User.DoesNotExist:
+    print(f"❌ User '{username}' not found. Create it first or update the username above.")
